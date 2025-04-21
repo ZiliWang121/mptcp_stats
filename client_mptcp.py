@@ -6,13 +6,16 @@ import signal
 import time
 import random
 import numpy as np
-import mpsched  # 需要你预先在系统中安装此模块
+import mpsched
 import pandas as pd
 import sys
+import subprocess
+import argparse
+import matplotlib.pyplot as plt
 
 BUFFER_SIZE = 1024
+PERF_RECORD_INTERVAL = 1.0
 keep_running = True
-PERF_RECORD_INTERVAL = 1.0  # seconds
 
 def signal_handler(sig, frame):
     global keep_running
@@ -22,7 +25,6 @@ signal.signal(signal.SIGINT, signal_handler)
 
 def create_mptcp_socket():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
-    # Enable MPTCP (42 is SOL_MPTCP in many kernels)
     s.setsockopt(socket.IPPROTO_TCP, 42, 1)
     return s
 
@@ -39,8 +41,6 @@ def get_subflow_metrics(fd):
     loss_weighted = []
 
     for sub in subs:
-        # sub[idx] 显示具体字段含义因 mpsched 实现而异
-        # 假设：sub[3]=rtt, sub[4]=throughput, sub[5]=segments_out, sub[6]=retrans
         rtt = sub[3]
         tp = sub[4]
         segs_out = sub[5]
@@ -56,52 +56,114 @@ def get_subflow_metrics(fd):
 
     return throughput_sum, max_latency, weighted_loss
 
-def main(server_ip, port):
+def set_scheduler(scheduler_name):
+    subprocess.run(["sysctl", f"net.mptcp.mptcp_scheduler={scheduler_name}"], check=True)
+
+def run_test(server_ip, port, scheduler, duration=10):
+    set_scheduler(scheduler)
+    time.sleep(1)
+
     sock = create_mptcp_socket()
     connect_socket(sock, server_ip, port)
-    print(f"Connected to {server_ip}:{port}, press Ctrl+C to stop.")
+    print(f"[{scheduler}] Connected to {server_ip}:{port}")
 
     total_sent = 0
     total_recv = 0
-    last_record = time.time()
+    start_time = time.time()
+    last_record = start_time
     metrics_log = []
-
-    buffer = generate_buffer()
     fd = sock.fileno()
+    buffer = generate_buffer()
 
-    while keep_running:
-        sent = sock.send(buffer)
-        if sent <= 0:
-            break
-        total_sent += sent
-
+    while keep_running and (time.time() - start_time < duration):
         try:
-            recv_data = sock.recv(BUFFER_SIZE)
-            total_recv += len(recv_data)
-        except BlockingIOError:
-            pass
+            sent = sock.send(buffer)
+            if sent <= 0:
+                break
+            total_sent += sent
 
-        if time.time() - last_record >= PERF_RECORD_INTERVAL:
-            throughput, latency, loss_rate = get_subflow_metrics(fd)
-            metrics_log.append({
-                "time": time.time(),
-                "throughput_total": throughput,
-                "latency_max": latency,
-                "segment_loss_rate_weighted": loss_rate
-            })
-            last_record = time.time()
+            try:
+                recv_data = sock.recv(BUFFER_SIZE)
+                total_recv += len(recv_data)
+            except BlockingIOError:
+                pass
 
-        time.sleep(0.05)
+            if time.time() - last_record >= PERF_RECORD_INTERVAL:
+                throughput, latency, loss_rate = get_subflow_metrics(fd)
+                metrics_log.append({
+                    "time": time.time() - start_time,
+                    "throughput_total": throughput,
+                    "latency_max": latency,
+                    "segment_loss_rate_weighted": loss_rate
+                })
+                last_record = time.time()
 
-    print(f"Finished. Sent: {total_sent // 1024} KB, Echo received: {total_recv // 1024} KB")
+            time.sleep(0.05)
+        except Exception as e:
+            print(f"[{scheduler}] Error: {e}")
+            break
+
     sock.close()
-
     df = pd.DataFrame(metrics_log)
-    df.to_csv("mptcp_metrics.csv", index=False)
-    print("Saved metrics to mptcp_metrics.csv")
+    filename = f"metrics_{scheduler}.csv"
+    df.to_csv(filename, index=False)
+    print(f"[{scheduler}] Saved to {filename}")
+    return filename
+
+def plot_metrics(csv_files):
+    plt.figure(figsize=(12, 6))
+    for csv in csv_files:
+        scheduler = csv.split("_")[1].split(".")[0]
+        df = pd.read_csv(csv)
+        plt.plot(df["time"], df["throughput_total"], label=f"{scheduler} - throughput")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Throughput (sum of subflows)")
+    plt.title("MPTCP Scheduler Comparison - Throughput")
+    plt.legend()
+    plt.grid()
+    plt.savefig("plot_throughput.png")
+
+    plt.figure(figsize=(12, 6))
+    for csv in csv_files:
+        scheduler = csv.split("_")[1].split(".")[0]
+        df = pd.read_csv(csv)
+        plt.plot(df["time"], df["latency_max"], label=f"{scheduler} - max latency")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Max Latency (ms)")
+    plt.title("MPTCP Scheduler Comparison - Max Latency")
+    plt.legend()
+    plt.grid()
+    plt.savefig("plot_latency.png")
+
+    plt.figure(figsize=(12, 6))
+    for csv in csv_files:
+        scheduler = csv.split("_")[1].split(".")[0]
+        df = pd.read_csv(csv)
+        plt.plot(df["time"], df["segment_loss_rate_weighted"], label=f"{scheduler} - loss rate")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Weighted Segment Loss Rate")
+    plt.title("MPTCP Scheduler Comparison - Loss Rate")
+    plt.legend()
+    plt.grid()
+    plt.savefig("plot_lossrate.png")
+
+    print("Plots saved: plot_throughput.png, plot_latency.png, plot_lossrate.png")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ip", required=True, help="Server IP")
+    parser.add_argument("--port", type=int, required=True, help="Server port")
+    parser.add_argument("--schedulers", nargs="+", required=True, help="Schedulers to test")
+    parser.add_argument("--duration", type=int, default=10, help="Test duration per scheduler (s)")
+    args = parser.parse_args()
+
+    csvs = []
+    for sched in args.schedulers:
+        print(f"🧪 Testing scheduler: {sched}")
+        csv_file = run_test(args.ip, args.port, sched, args.duration)
+        csvs.append(csv_file)
+
+    plot_metrics(csvs)
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <server_ip> <port>")
-        sys.exit(1)
-    main(sys.argv[1], int(sys.argv[2]))
+    main()
