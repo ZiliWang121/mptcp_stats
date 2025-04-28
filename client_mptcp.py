@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 
 import socket
@@ -11,6 +10,7 @@ import pandas as pd
 import sys
 import subprocess
 import argparse
+import os
 import matplotlib.pyplot as plt
 
 BUFFER_SIZE = 1024
@@ -57,12 +57,10 @@ def get_subflow_metrics(fd):
     return throughput_sum, max_latency, weighted_loss
 
 def set_scheduler(scheduler_name):
-    subprocess.run(["sysctl", f"net.mptcp.mptcp_scheduler={scheduler_name}"], check=True)
+    print(f"🔧 Setting scheduler to {scheduler_name} in root namespace...")
+    subprocess.run(["sudo", "sysctl", f"net.mptcp.mptcp_scheduler={scheduler_name}"], check=True)
 
 def run_test(server_ip, port, scheduler, duration=10):
-    set_scheduler(scheduler)
-    time.sleep(1)
-
     sock = create_mptcp_socket()
     connect_socket(sock, server_ip, port)
     print(f"[{scheduler}] Connected to {server_ip}:{port}")
@@ -107,7 +105,7 @@ def run_test(server_ip, port, scheduler, duration=10):
     df = pd.DataFrame(metrics_log)
     filename = f"metrics_{scheduler}.csv"
     df.to_csv(filename, index=False)
-    print(f"[{scheduler}] Saved to {filename}")
+    print(f"[{scheduler}] Metrics saved to {filename}")
     return filename
 
 def plot_metrics(csv_files):
@@ -147,7 +145,15 @@ def plot_metrics(csv_files):
     plt.grid()
     plt.savefig("plot_lossrate.png")
 
-    print("Plots saved: plot_throughput.png, plot_latency.png, plot_lossrate.png")
+    print("✅ Plots saved: plot_throughput.png, plot_latency.png, plot_lossrate.png")
+
+def main_inside_namespace(args):
+    csvs = []
+    for sched in args.schedulers:
+        print(f"🧪 Testing scheduler: {sched}")
+        csv_file = run_test(args.ip, args.port, sched, args.duration)
+        csvs.append(csv_file)
+    plot_metrics(csvs)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -155,15 +161,23 @@ def main():
     parser.add_argument("--port", type=int, required=True, help="Server port")
     parser.add_argument("--schedulers", nargs="+", required=True, help="Schedulers to test")
     parser.add_argument("--duration", type=int, default=10, help="Test duration per scheduler (s)")
+    parser.add_argument("--already_in_ns", action="store_true", help="Internal flag for namespace execution")
     args = parser.parse_args()
 
-    csvs = []
-    for sched in args.schedulers:
-        print(f"🧪 Testing scheduler: {sched}")
-        csv_file = run_test(args.ip, args.port, sched, args.duration)
-        csvs.append(csv_file)
-
-    plot_metrics(csvs)
+    if not args.already_in_ns:
+        for sched in args.schedulers:
+            # 先在主机空间设置 scheduler
+            set_scheduler(sched)
+            time.sleep(1)
+            # 进入 namespace 执行实际发送
+            cmd = ["sudo", "ip", "netns", "exec", "ns-mptcp", "python3", sys.argv[0],
+                   "--ip", args.ip, "--port", str(args.port),
+                   "--schedulers", sched,
+                   "--duration", str(args.duration),
+                   "--already_in_ns"]
+            subprocess.run(cmd, check=True)
+    else:
+        main_inside_namespace(args)
 
 if __name__ == "__main__":
     main()
