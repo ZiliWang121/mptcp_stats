@@ -10,7 +10,7 @@ NAMESPACE = "ns-mptcp"
 
 def set_scheduler(scheduler_name):
     subprocess.run(["sudo", "sysctl", f"net.mptcp.mptcp_scheduler={scheduler_name}"], check=True)
-    print(f"✅ Scheduler set to {scheduler_name}")
+    print(f"Scheduler set to {scheduler_name}")
 
 def run_in_namespace(server_ip, port, duration, output_csv):
     cmd = [
@@ -70,7 +70,7 @@ def main():
 
     csvs = []
     for sched in args.schedulers:
-        print(f"\n🧪 Testing scheduler: {sched}")
+        print(f"\nTesting scheduler: {sched}")
         set_scheduler(sched)
         csv_file = f"metrics_{sched}.csv"
         run_in_namespace(args.ip, args.port, args.duration, csv_file)
